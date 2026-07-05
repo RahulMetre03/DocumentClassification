@@ -8,8 +8,8 @@ import fitz  # pymupdf
 import pytesseract
 import ollama
 import chromadb
+from urllib.parse import urlparse, parse_qs
 from PIL import Image
-from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -180,25 +180,59 @@ async def download_document(request: DownloadRequest):
         url = request.url
         logger.info("Received request for url: %s", url)
 
+        # Determine download URL
         if "docs.google.com/document" in url:
             doc_id = url.split("/d/")[1].split("/")[0]
             download_url = f"https://docs.google.com/document/d/{doc_id}/export?format=pdf"
+
+        elif "drive.google.com/file/d/" in url:
+            file_id = url.split("/d/")[1].split("/")[0]
+            download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+        elif "drive.google.com/open" in url and "id=" in url:
+            file_id = parse_qs(urlparse(url).query)["id"][0]
+            download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+        elif "drive.google.com/uc" in url:
+            download_url = url
+
         else:
             download_url = url
 
         logger.info("Downloading from: %s", download_url)
+
+        # Download
         response = requests.get(download_url, timeout=60)
         response.raise_for_status()
-        logger.info("Download complete, status=%s, bytes=%d", response.status_code, len(response.content))
 
+        logger.info(
+            "Download complete | Status=%s | Content-Type=%s | Bytes=%d",
+            response.status_code,
+            response.headers.get("Content-Type"),
+            len(response.content),
+        )
+
+        # Validate response
+        content_type = response.headers.get("Content-Type", "").lower()
+
+        if "text/html" in content_type:
+            raise HTTPException(
+                status_code=400,
+                detail="Unable to download the Google Drive file. Ensure it is shared publicly ('Anyone with the link') and that the URL points to a downloadable file."
+            )
+
+        # Generate filename
         filename = os.path.basename(urlparse(download_url).path)
-        if not filename.endswith(".pdf"):
+
+        if not filename or "." not in filename:
             filename = f"{uuid.uuid4()}.pdf"
+
         file_path = os.path.join(DOWNLOAD_DIR, filename)
 
         with open(file_path, "wb") as f:
             f.write(response.content)
-        logger.info("Saved file to: %s", file_path)
+
+        logger.info("Saved file to %s", file_path)
 
         logger.info("Extracting text...")
         extracted_text = extract_content(file_path)
