@@ -10,6 +10,7 @@ import ollama
 import chromadb
 from urllib.parse import urlparse, parse_qs
 from PIL import Image
+from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -41,27 +42,17 @@ import time
 GEMINI_API = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=GEMINI_API)
 
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    embeddings = []
 
-class GeminiEmbeddingFunction(EmbeddingFunction):
-    """Chroma embedding function backed by Gemini."""
+    for text in texts:
+        response = client.models.embed_content(
+            model="gemini-embedding-2",
+            contents=text,
+        )
+        embeddings.append(response.embeddings[0].values)
 
-    def __call__(self, input: Documents) -> Embeddings:
-        logger.info("Embedding %d chunk(s) via Gemini...", len(input))
-
-        try:
-            response = client.models.embed_content(
-                model="gemini-embedding-2",
-                contents=list(input)
-            )
-
-            embeddings = [e.values for e in response.embeddings]
-
-            logger.info("Embedding complete.")
-            return embeddings
-
-        except Exception as e:
-            logger.error("Gemini embedding failed: %r", e)
-            raise
+    return embeddings
 
 chroma = chromadb.CloudClient(
   api_key=os.getenv("CHROMA_API"),
@@ -70,8 +61,7 @@ chroma = chromadb.CloudClient(
 )
 
 collection = chroma.get_or_create_collection(
-    name="medical_documents",
-    embedding_function=GeminiEmbeddingFunction(),
+    name="medical_documents"
 )
 
 app = FastAPI()
@@ -160,18 +150,35 @@ Document:
 # ---------- CHUNK + STORE IN CHROMA ----------
 def store_document(document_text: str, file_name: str, metadata: dict) -> tuple[str, int]:
     document_id = str(uuid.uuid4())
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=150
+    )
+
     chunks = splitter.split_text(document_text)
+    embeddings = embed_texts(chunks)
 
     ids = [f"{document_id}_{i}" for i in range(len(chunks))]
+
     metadatas = [
-        {"document_id": document_id, "chunk_number": i, "file_name": file_name, **metadata}
+        {
+            "document_id": document_id,
+            "chunk_number": i,
+            "file_name": file_name,
+            **metadata,
+        }
         for i in range(len(chunks))
     ]
 
-    collection.add(ids=ids, documents=chunks, metadatas=metadatas)
-    return document_id, len(chunks)
+    collection.add(
+        ids=ids,
+        documents=chunks,
+        embeddings=embeddings,
+        metadatas=metadatas,
+    )
 
+    return document_id, len(chunks)
 
 # ---------- MAIN ENDPOINT ----------
 @app.post("/download-document")
@@ -266,12 +273,13 @@ class SearchRequest(BaseModel):
 @app.post("/search-medical-documents")
 def search_medical_documents(request: SearchRequest):
     try:
+        query_embedding = embed_texts([request.query])[0]
+
         results = collection.query(
-            query_texts=[request.query],
+            query_embeddings=[query_embedding],
             n_results=request.top_k,
             include=["documents", "metadatas", "distances"]
         )
-
         documents = []
 
         for doc, meta, distance in zip(
